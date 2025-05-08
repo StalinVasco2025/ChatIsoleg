@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE 5000
 
 # Ejecutar la aplicación
-CMD ["python", "app1.py"]
+CMD ["python", "app.py"]

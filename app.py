@@ -1,296 +1,93 @@
-from flask import Flask, request, jsonify, render_template
-from dotenv import load_dotenv
 import os
-from google import genai
-import fitz  # PyMuPDF
+import faiss
+import numpy as np
+from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
-import json
-import re
+from google import genai
+from PyPDF2 import PdfReader
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload
+# Configuración de la API de Gemini
+client = genai.Client(api_key="AIzaSyCpzD4M30B2Yx6p8XwCBcDYzdoYxB-24p4")
 
-# Crear carpeta de uploads si no existe
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+# Configuración del proyecto Flask
+app = Flask(__name__)
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
 
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+def leer_pdf(path):
+    # Leer el PDF y extraer texto
+    reader = PdfReader(path)
+    return [page.extract_text() for page in reader.pages if page.extract_text()]
 
-# Inicializar cliente Gemini
-client = genai.Client(api_key=GEMINI_API_KEY)
-model = client.models
+def agrupar_texto(paginas, tamaño=3):
+    # Agrupar el texto en bloques de tamaño específico
+    return ["\n".join(paginas[i:i + tamaño]) for i in range(0, len(paginas), tamaño)]
 
+def generar_embedding(texto):
+    # Generar embedding usando Gemini
+    return np.array(client.models.embed_content(
+        model="gemini-embedding-exp-03-07",
+        contents=texto
+    ).embeddings, dtype='float32')
 
-# Ruta principal
 @app.route('/')
 def index():
-    return render_template('index2.html')
+    return render_template("index.html")
 
+@app.route('/procesar', methods=['POST'])
+def procesar():
+    # Procesar el archivo PDF y el caso de estudio
+    archivo = request.files['archivo']
+    caso = request.form['caso']
 
-# Función para extraer texto del PDF
-def extract_text_from_pdf(pdf_path):
-    text = ""
-    try:
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            text += page.get_text()
-        return text
-    except Exception as e:
-        print(f"Error al extraer texto del PDF: {e}")
-        return ""
+    if not archivo or not caso:
+        return jsonify({'error': 'Archivo o texto faltante'})
 
+    # Guardar el archivo PDF
+    filename = secure_filename(archivo.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    archivo.save(filepath)
 
-# Subida del documento PDF genérico
-@app.route('/upload-document', methods=['POST'])
-def upload_document():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+    # Leer y agrupar el texto del PDF
+    texto = leer_pdf(filepath)
+    bloques = agrupar_texto(texto, tamaño=2)
 
-    file = request.files['file']
+    textos = []
+    vectores = []
 
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-
-    if file and file.filename.endswith('.pdf'):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-
-        pdf_text = extract_text_from_pdf(filepath)
-
-        if not pdf_text:
-            return jsonify({'error': 'No se pudo extraer texto del PDF'}), 400
-
-        session_id = request.form.get('session_id', 'default')
-        document_type = request.form.get('document_type', 'generic')
-        text_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{document_type}.txt")
-
-        with open(text_filepath, 'w', encoding='utf-8') as f:
-            f.write(pdf_text)
-
-        # Extraer título del documento
-        title = filename.replace('.pdf', '')
-
-        return jsonify({
-            'success': True,
-            'message': f'PDF procesado correctamente. Se extrajeron {len(pdf_text)} caracteres.',
-            'pages': len(fitz.open(filepath)),
-            'title': title
-        })
-
-    return jsonify({'error': 'Tipo de archivo no permitido'}), 400
-
-
-# Generar caso de estudio basado en el documento
-@app.route('/generate-case-study', methods=['POST'])
-def generate_case_study():
-    data = request.json
-    session_id = data.get('session_id', 'default')
-    document_type = data.get('document_type', 'generic')
-
-    text_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{document_type}.txt")
-
-    try:
-        with open(text_filepath, 'r', encoding='utf-8') as f:
-            document_text = f.read()
-    except FileNotFoundError:
-        return jsonify({'error': 'No se ha subido ningún documento'}), 400
-
-    prompt = f"""
-    ## Instrucciones
-    Eres un experto en la generación de casos de estudio. Has recibido un documento técnico o normativo. 
-    Tu tarea es crear un caso de estudio práctico y realista basado en el contenido del documento.
-
-    ## Contenido del Documento (extracto)
-    {document_text[:50000]}
-
-    ## Requisitos del Caso de Estudio
-    1. El caso debe ser ficticio pero realista
-    2. Debe contener elementos que permitan aplicar los principios clave del documento
-    3. Incluir nombres de empresas ficticias, personajes y situaciones con suficiente detalle
-    4. El caso debe presentar problemas o dilemas que requieran análisis
-    5. Extender entre 600-1000 palabras aproximadamente
-
-    ## Formato de Respuesta
-    Proporciona el caso de estudio con un título apropiado, contexto, descripción de la situación problemática 
-    y suficientes detalles para que sea analizado.
-    """
-
-    try:
-        response = model.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
-        case_study = response.text
-
-        case_study_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_case_study.txt")
-        with open(case_study_filepath, 'w', encoding='utf-8') as f:
-            f.write(case_study)
-
-        return jsonify({'case_study': case_study})
-
-    except Exception as e:
-        return jsonify({'error': f'Error al generar caso de estudio: {str(e)}'}), 500
-
-
-# Análisis del caso de estudio
-@app.route('/analyze-case', methods=['POST'])
-def analyze_case():
-    data = request.json
-    caso_estudio = data.get('caso', '')
-    session_id = data.get('session_id', 'default')
-    document_type = data.get('document_type', 'generic')
-
-    if not caso_estudio:
-        return jsonify({'error': 'El caso de estudio está vacío'}), 400
-
-    text_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{document_type}.txt")
-
-    try:
-        with open(text_filepath, 'r', encoding='utf-8') as f:
-            document_text = f.read()
-    except FileNotFoundError:
-        return jsonify({'error': 'No se ha subido ningún documento de referencia'}), 400
-
-    prompt = f"""
-    ## Instrucciones
-    Eres un experto en el documento que se proporciona a continuación. Analiza el siguiente caso de estudio 
-    en relación con el documento de referencia. Debes identificar los aspectos clave del caso, 
-    relacionarlos con secciones específicas del documento y proporcionar recomendaciones detalladas.
-
-    ## Contenido del Documento de Referencia (extracto)
-    {document_text[:50000]}
-
-    ## Caso de Estudio
-    {caso_estudio}
-
-    ## Formato de Respuesta
-    Estructura tu respuesta de la siguiente manera:
-    1. Resumen del caso
-    2. Términos clave identificados en el caso y su relación con el documento
-    3. Secciones relevantes del documento aplicables al caso
-    4. Recomendaciones específicas basadas en el documento de referencia
-    5. Conclusión
-    """
-
-    try:
-        response = model.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
-        analysis = response.text
-
-        analysis_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_analysis.txt")
-        with open(analysis_filepath, 'w', encoding='utf-8') as f:
-            f.write(analysis)
-
-        return jsonify({'analysis': analysis})
-
-    except Exception as e:
-        return jsonify({'error': f'Error al generar análisis: {str(e)}'}), 500
-
-
-# Evaluación de la respuesta del usuario
-@app.route('/evaluate-response', methods=['POST'])
-def evaluate_response():
-    data = request.json
-    user_response = data.get('userResponse', '')
-    session_id = data.get('session_id', 'default')
-    document_type = data.get('document_type', 'generic')
-
-    if not user_response:
-        return jsonify({'error': 'La respuesta del usuario está vacía'}), 400
-
-    analysis_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_analysis.txt")
-
-    try:
-        with open(analysis_filepath, 'r', encoding='utf-8') as f:
-            gemini_analysis = f.read()
-    except FileNotFoundError:
-        return jsonify({'error': 'No se ha generado un análisis previo'}), 400
-
-    text_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{document_type}.txt")
-
-    try:
-        with open(text_filepath, 'r', encoding='utf-8') as f:
-            document_text = f.read()
-    except FileNotFoundError:
-        return jsonify({'error': 'No se encuentra el documento de referencia'}), 400
-
-    prompt = f"""
-    ## Instrucciones
-    Eres un experto evaluador en el tema del documento de referencia. Tu tarea es comparar dos análisis de un caso de estudio:
-    1. El análisis generado por IA (modelo Gemini)
-    2. El análisis proporcionado por un usuario
-
-    El documento de referencia trata sobre:
-    {document_text[:1000]}...
-
-    Debes evaluar ambos análisis con base en los siguientes criterios:
-    - Precisión y exactitud en relación con el documento de referencia
-    - Comprensión del caso de estudio
-    - Calidad de las recomendaciones
-    - Estructura y claridad
-    - Aplicabilidad práctica
-
-    ## Análisis generado por IA
-    {gemini_analysis}
-
-    ## Análisis del usuario
-    {user_response}
-
-    ## Formato de Respuesta
-    Tu evaluación debe seguir este formato JSON:
-    {{
-        "calificacionIA": X,
-        "calificacionUsuario": Y,
-        "confianzaIA": Z,
-        "confianzaUsuario": W,
-        "comentarioGeneral": "Comentario",
-        "fortalezasIA": ["..."],
-        "debilidadesIA": ["..."],
-        "fortalezasUsuario": ["..."],
-        "debilidadesUsuario": ["..."],
-        "recomendacionMejora": "..."
-    }}
-    """
-
-    try:
-        response = model.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
-        evaluation_text = response.text
-
-        json_match = re.search(r'```json\s*(.*?)\s*```', evaluation_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            json_match = re.search(r'({.*})', evaluation_text, re.DOTALL)
-            json_str = json_match.group(1) if json_match else evaluation_text
-
+    # Generar embeddings de los bloques
+    for bloque in bloques:
         try:
-            evaluation = json.loads(json_str)
-        except json.JSONDecodeError:
-            evaluation = {
-                "calificacionIA": 7.0,
-                "calificacionUsuario": 6.0,
-                "confianzaIA": 85,
-                "confianzaUsuario": 70,
-                "comentarioGeneral": "No se pudo extraer una evaluación estructurada.",
-                "fortalezasIA": ["Análisis estructurado"],
-                "debilidadesIA": ["No especificado"],
-                "fortalezasUsuario": ["Perspectiva personal"],
-                "debilidadesUsuario": ["No especificado"],
-                "recomendacionMejora": "Revisa la estructura y contenido de tu análisis para mejorar la calificación."
-            }
+            emb = generar_embedding(bloque)
+            vectores.append(emb)
+            textos.append(bloque)
+        except Exception as e:
+            print("Error embedding:", e)
 
-        return jsonify(evaluation)
+    # Crear índice FAISS
+    dim = vectores[0].shape[0]
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(vectores))
 
-    except Exception as e:
-        return jsonify({'error': f'Error al evaluar respuesta: {str(e)}'}), 500
+    # Embedding del caso de estudio
+    caso_vec = generar_embedding(caso).reshape(1, -1)
 
+    # Buscar el bloque más similar
+    D, I = index.search(caso_vec, 1)
+    bloque_relevante = textos[I[0][0]]
+
+    # Preparar el prompt para Gemini
+    prompt = f"Caso de estudio:\n{caso}\n\nContenido del documento relacionado:\n{bloque_relevante}"
+
+    # Obtener la respuesta de Gemini
+    respuesta = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt
+    )
+
+    return jsonify({'respuesta': respuesta.text})
 
 if __name__ == '__main__':
     app.run(debug=True)
